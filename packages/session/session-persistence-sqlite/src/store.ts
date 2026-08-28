@@ -215,13 +215,20 @@ export class SqliteStore implements PersistenceBackend<number> {
     meta: SessionHeader,
     tornMarker: number | undefined,
     closers: readonly SessionEvent[],
+    expectedRevision?: PersistenceRevision,
   ): Promise<void> {
     await this.open()
-    if (tornMarker === undefined && closers.length === 0) return
+    if (tornMarker === undefined && closers.length === 0 && expectedRevision === undefined) return
     this.db.exec(sql('begin-immediate'))
     try {
       validateSchemaForMutation(this.databaseConstructor, this.db, this.databasePath)
       const row = this.rowFor(meta.id)
+      if (expectedRevision !== undefined) {
+        const currentRevision = row === undefined ? undefined : sqliteRevision(this.storeIdentity, row)
+        if (currentRevision !== expectedRevision) {
+          throw new Error(`session ${meta.id} changed since it was read (stored revision moved)`)
+        }
+      }
       if (row === undefined) throw new Error(`session ${meta.id} metadata row is missing`)
       const sessionKey = this.sessionKey(meta.id)
       const currentRows = this.db.prepare(sql('select-events')).all(sessionKey).map(decodeEventRow)
@@ -245,7 +252,7 @@ export class SqliteStore implements PersistenceBackend<number> {
         const insert = this.insertStatement()
         for (const closer of closers) this.insertRecord(insert, sessionKey, bindRecord(closer))
       }
-      this.incrementRevision(meta.id)
+      if (tornMarker !== undefined || closers.length > 0) this.incrementRevision(meta.id)
       this.db.exec(sql('commit'))
     } catch (error: unknown) {
       this.rollback(error, 'repair')

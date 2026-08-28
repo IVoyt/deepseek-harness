@@ -33,6 +33,7 @@ import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
 } from './zstd.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
+import { acquireSingleWriter, type SingleWriterHandle } from '@deepseek-ai/dsh-session-persistence/single-writer'
 
 export type { JsonlCompression } from './format.ts'
 
@@ -146,6 +147,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private compression: JsonlCompression
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
+  private guards = new Map<string, SingleWriterHandle>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx)
@@ -163,6 +165,11 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       preparedSessionCacheSize,
       writeBatchMaxDelayMs,
     })
+    this.ctx.effect(() => async () => {
+      const handles = [...this.guards.values()]
+      this.guards.clear()
+      await Promise.all(handles.map(handle => handle.release()))
+    }, `${this.name} single-writer guards`)
   }
 
   // Each backend keeps the typed service API beside its storage hooks;
@@ -428,9 +435,79 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     }
   }
 
+  private async acquireGuard(artifact: string): Promise<SingleWriterHandle> {
+    const existing = this.guards.get(artifact)
+    if (existing !== undefined) return existing
+    try {
+      await mkdir(dirname(artifact), { recursive: true })
+    } catch {
+      // Best effort: the subsequent open will surface the error.
+    }
+    const handle = await acquireSingleWriter(artifact, (stale: { pid: number }) => {
+      this.ctx.logger.warn(`took over single-writer lock for ${JSON.stringify(artifact)} from dead pid ${stale.pid}`)
+    })
+    this.guards.set(artifact, handle)
+    return handle
+  }
+
+  private async ensureGuardAndVerifyBase(
+    meta: SessionHeader,
+    events: readonly SessionEvent[],
+    isMaterialized: boolean,
+    artifact: string,
+  ): Promise<void> {
+    await this.acquireGuard(artifact)
+    const stored = await this.loadStored(meta.id).catch((error: unknown) => {
+      // A corrupt committed region must surface as that corruption, not as a generic base error.
+      if (error instanceof Error && /seq gap in committed region/.test(error.message)) throw error
+      throw error
+    })
+    if (stored === undefined) {
+      if (isMaterialized) {
+        throw new Error(`session "${meta.id}" is missing (log vanished outside this process)`)
+      }
+      return
+    }
+    if (stored.tornMarker !== undefined) {
+      await this.repair(meta, stored.tornMarker.truncateTo)
+      if (stored.tornMarker.recoveredEvents.length > 0) {
+        await this.appendLines(meta, stored.tornMarker.recoveredEvents)
+      }
+      const fresh = await this.loadStored(meta.id)
+      if (fresh === undefined) throw new Error(`session "${meta.id}" is missing (log vanished during repair)`)
+      // Use fresh base for verification; torn tail already discarded.
+      const freshLen = fresh.events.length
+      const firstSeq = events[0]?.seq
+      if (firstSeq !== undefined) {
+        if (firstSeq < freshLen) {
+          throw new Error(`session "${meta.id}" tail advanced outside this process (stored ${freshLen}, got ${firstSeq})`)
+        }
+        if (firstSeq > freshLen) {
+          throw new Error(`session "${meta.id}" tail shrank or was replaced outside this process (stored ${freshLen}, got ${firstSeq})`)
+        }
+      }
+      return
+    }
+    // No torn tail — verify directly.
+    const storedLen = stored.events.length
+    // Corrupt committed region already throws from loadStored; no need to re-check here.
+    const firstSeq = events[0]?.seq
+    if (firstSeq !== undefined) {
+      if (firstSeq < storedLen) {
+        throw new Error(`session "${meta.id}" tail advanced outside this process (stored ${storedLen}, got ${firstSeq})`)
+      }
+      if (firstSeq > storedLen) {
+        throw new Error(`session "${meta.id}" tail shrank or was replaced outside this process (stored ${storedLen}, got ${firstSeq})`)
+      }
+    }
+  }
+
   /** Durably append a batch, lazily materializing the file when not yet present. */
   async appendBatch(meta: SessionHeader, events: readonly SessionEvent[], isMaterialized: boolean): Promise<void> {
     await this.ensureRootEncoding()
+    if (events.length === 0) return
+    const artifact = logPath(this.root, meta.cwd, meta.id, this.compression)
+    await this.ensureGuardAndVerifyBase(meta, events, isMaterialized, artifact)
     if (isMaterialized) {
       await this.appendLines(meta, events)
     } else {
@@ -446,13 +523,24 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   /**
    * Make a crash repair durable: truncate a torn tail, restore complete events
    * decoded from it, then append synthetic closers. Two fsync'd steps — the seam
-   * does not require this to be atomic.
+   * does not require this to be atomic. When `expectedRevision` is provided the
+   * current file identity is compared and a mismatch rejects with "changed since
+   * it was read".
    */
   async commitRepair(
     meta: SessionHeader,
     tornMarker: JsonlTornMarker | undefined,
     closers: readonly SessionEvent[],
+    expectedRevision?: PersistenceRevision,
   ): Promise<void> {
+    const artifact = logPath(this.root, meta.cwd, meta.id, this.compression)
+    await this.acquireGuard(artifact)
+    if (expectedRevision !== undefined) {
+      const current = await this.readStoredRevision(meta.id)
+      if (current !== expectedRevision) {
+        throw new Error(`session "${meta.id}" changed since it was read (stored revision moved)`)
+      }
+    }
     if (tornMarker !== undefined) await this.repair(meta, tornMarker.truncateTo)
     const repairedEvents = [...(tornMarker?.recoveredEvents ?? []), ...closers]
     if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents)
