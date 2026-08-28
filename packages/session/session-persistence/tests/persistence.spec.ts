@@ -164,7 +164,12 @@ class MemoryPersistence extends SessionPersistence implements PersistenceBackend
     return Promise.resolve()
   }
 
-  async commitRepair(m: SessionHeader, _tornMarker: undefined, closers: readonly SessionEvent[]): Promise<void> {
+  async commitRepair(
+    m: SessionHeader,
+    _tornMarker: undefined,
+    closers: readonly SessionEvent[],
+    _expectedRevision?: SessionPersistenceRevision,
+  ): Promise<void> {
     // No torn tails in a Map store, so `_tornMarker` is always undefined; only the
     // synthetic closers are appended (the same DELETE+INSERT a DB backend does,
     // minus the truncate).
@@ -237,7 +242,12 @@ class ControlledBackend implements PersistenceBackend<never> {
     }
   }
 
-  async commitRepair(m: SessionHeader, _tornMarker: undefined, closers: readonly SessionEvent[]): Promise<void> {
+  async commitRepair(
+    m: SessionHeader,
+    _tornMarker: undefined,
+    closers: readonly SessionEvent[],
+    _expectedRevision?: SessionPersistenceRevision,
+  ): Promise<void> {
     this.repairAttempts += 1
     const entry = this.store.get(m.id)
     if (entry !== undefined) entry.events.push(...structuredClone(closers) as SessionEvent[])
@@ -1049,8 +1059,8 @@ describe('PersistenceCoordinator session preparations', () => {
       events: [{ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }],
     })
     const commitRepair = backend.commitRepair.bind(backend)
-    vi.spyOn(backend, 'commitRepair').mockImplementation(async (header, tornMarker, closers) => {
-      await commitRepair(header, tornMarker, closers)
+    vi.spyOn(backend, 'commitRepair').mockImplementation(async (header, tornMarker, closers, revision) => {
+      await commitRepair(header, tornMarker, closers, revision)
       const entry = backend.store.get(id)
       if (entry === undefined) throw new Error('test repair must keep storage materialized')
       const seq = entry.events.length
@@ -1094,8 +1104,8 @@ describe('PersistenceCoordinator session preparations', () => {
       events: [{ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }],
     })
     const commitRepair = backend.commitRepair.bind(backend)
-    vi.spyOn(backend, 'commitRepair').mockImplementation(async (header, tornMarker, closers) => {
-      await commitRepair(header, tornMarker, closers)
+    vi.spyOn(backend, 'commitRepair').mockImplementation(async (header, tornMarker, closers, revision) => {
+      await commitRepair(header, tornMarker, closers, revision)
       backend.store.delete(id)
     })
     let coordinator!: PersistenceCoordinator<never>

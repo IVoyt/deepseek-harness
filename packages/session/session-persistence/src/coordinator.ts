@@ -191,9 +191,16 @@ export interface PersistenceBackend<TornMarker = unknown> {
    * `tornMarker !== undefined`) and append `closers` (iff any). NOT required to
    * be atomic — a file backend may truncate-then-append in two fsync'd steps.
    * Used by load (truncate + synthetic closers) and by live-adoption (truncate
-   * only, `closers = []`).
+   * only, `closers = []`). When `expectedRevision` is provided the backend
+   * verifies the store still carries that revision before mutating and rejects
+   * with "changed since it was read" when it does not.
    */
-  commitRepair(meta: SessionHeader, tornMarker: TornMarker | undefined, closers: readonly SessionEvent[]): Promise<void>
+  commitRepair(
+    meta: SessionHeader,
+    tornMarker: TornMarker | undefined,
+    closers: readonly SessionEvent[],
+    expectedRevision?: SessionPersistenceRevision,
+  ): Promise<void>
 
   /**
    * List all stored (materialized) sessions' metadata.
@@ -1023,7 +1030,7 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     }
     if (!await this.isPreparedSourceCurrent(source)) return undefined
     if (source.tornMarker !== undefined || source.closers.length > 0) {
-      await this.backend.commitRepair(source.inspection.meta, source.tornMarker, source.closers)
+      await this.backend.commitRepair(source.inspection.meta, source.tornMarker, source.closers, source.revision)
       // The repair changed the durable revision. Reload the exact committed
       // graph instead of associating the old in-memory view with a newer revision.
       return undefined
@@ -1389,7 +1396,7 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       throw new Error(`session "${session.header.id}" already has a persisted log on disk that does not match this live session (id collision)`)
     }
     // Truncate-only repair (no closers): the open turn is NOT closed here.
-    if (tornMarker !== undefined) await this.backend.commitRepair(meta, tornMarker, [])
+    if (tornMarker !== undefined) await this.backend.commitRepair(meta, tornMarker, [], stored.revision)
     this.states.set(session.header.id, {
       meta: { ...meta },
       cursor: storedEvents.length,
