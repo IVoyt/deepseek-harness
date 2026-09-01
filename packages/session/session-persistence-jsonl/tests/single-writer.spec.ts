@@ -15,9 +15,10 @@ import { ChildProcess, spawn } from 'node:child_process'
 import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import type { SessionStorageMetadata } from '@deepseek-ai/dsh-session-persistence'
 import { compressZstdFrame, decompressZstdPrefix, scanZstdFrames } from '../src/zstd.ts'
 import { eventLines, logPath, toHeaderLine, type JsonlCompression } from '../src/format.ts'
 import { meta, oneTurnLog } from '../../session-persistence/tests/contract.ts'
@@ -67,6 +68,11 @@ function chunkEvent(seq: number): SessionEvent {
     time: 1000 + seq,
     data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: `t${seq}` } },
   } as unknown as SessionEvent
+}
+
+/** Pair an unseeded header with its required zero inherited cut. */
+function storageOf(meta: SessionHeader): SessionStorageMetadata {
+  return { meta, inheritedEventCount: SessionLogOffset(0) }
 }
 
 /** Spawn a live foreign process and stand up its sidecar next to `artifactPath`. */
@@ -129,7 +135,7 @@ describe.each([
     const artifact = logPath(root, WORK, id, compression)
     const foreignPid = await liveForeignOwner(artifact)
     await expect(
-      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(100)], true),
+      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(100)], true),
     ).rejects.toThrow(new RegExp(`being written by another dsh process \\(pid ${foreignPid}`))
     // The rejected write must not have touched the log.
     expect(await (b.sessionPersistence as JsonlSessionPersistence).readStoredRevision(id))
@@ -155,7 +161,7 @@ describe.each([
     await writeFile(artifact + '.lock', `${JSON.stringify({ pid: deadPid, createdAt: Date.now() })}\n`, { mode: 0o600 })
 
     const b = await mount(root, compression)
-    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(nextSeq)], true)
+    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(nextSeq)], true)
     const loaded = await b.sessionPersistence.load(id)
     expect(loaded.events.length).toBe(nextSeq + 1)
     expect(loaded.events.at(-1)?.seq).toBe(nextSeq)
@@ -173,7 +179,7 @@ describe.each([
     // B's in-memory view ends at seq 1 (it never saw the third event): its
     // first write must be rejected, not appended after the advanced tail.
     await expect(
-      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(2), chunkEvent(3)], true),
+      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(2), chunkEvent(3)], true),
     ).rejects.toThrow(/advanced outside this process/)
     const loaded = await b.sessionPersistence.load(id)
     expect(loaded.events.length).toBe(3)
@@ -205,7 +211,7 @@ describe.each([
     const b = await mount(root, compression)
     // B's view still ends at seq 2, but the log now ends at seq 1.
     await expect(
-      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(3)], true),
+      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(3)], true),
     ).rejects.toThrow(/shrank or was replaced outside this process/)
   })
 
@@ -221,7 +227,7 @@ describe.each([
 
     const b = await mount(root, compression)
     await expect(
-      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(2)], true),
+      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(2)], true),
     ).rejects.toThrow(/is missing/)
   })
 
@@ -245,7 +251,7 @@ describe.each([
     }
 
     const b = await mount(root, compression)
-    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(2)], true)
+    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(2)], true)
     const loaded = await b.sessionPersistence.load(id)
     expect(loaded.events.map(event => event.seq)).toEqual([0, 1, 2])
   })
@@ -283,7 +289,7 @@ describe.each([
     await expect(stat(artifact + '.lock')).rejects.toThrow()
 
     const b = await mount(root, compression)
-    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(1)], true)
+    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(1)], true)
     const loaded = await b.sessionPersistence.load(id)
     expect(loaded.events.map(event => event.seq)).toEqual([0, 1])
   })
@@ -308,10 +314,10 @@ describe.each([
       await appendFile(artifact, `${JSON.stringify(chunkEvent(3))}\n`)
     }
 
-    await expect(backend.commitRepair(m, undefined, [], observed)).rejects.toThrow(/changed since it was read/)
+    await expect(backend.commitRepair(storageOf(m), undefined, [], observed)).rejects.toThrow(/changed since it was read/)
     const fresh = await backend.readStoredRevision(id)
     if (fresh === undefined) throw new Error('test fixture: revision missing after write')
-    await backend.commitRepair(m, undefined, [chunkEvent(4)], fresh)
+    await backend.commitRepair(storageOf(m), undefined, [chunkEvent(4)], fresh)
     const loaded = await a.sessionPersistence.load(id)
     expect(loaded.events.map(event => event.seq)).toEqual([0, 1, 2, 3, 4])
   })
@@ -333,7 +339,7 @@ describe.each([
 
     const b = await mount(root, compression)
     const warn = vi.spyOn(b.logger, 'warn')
-    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(1)], true)
+    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(1)], true)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(`dead pid ${deadPid}`))
     warn.mockRestore()
   })
@@ -349,7 +355,7 @@ describe('JSONL single-writer guard: header-only and encoding edges', () => {
     await mkdir(dirname(artifact), { recursive: true })
     await writeFile(artifact, `${JSON.stringify(toHeaderLine(m))}\n`)
 
-    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(0)], true)
+    await (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(0)], true)
     const loaded = await b.sessionPersistence.load(id)
     expect(loaded.events.map(event => event.seq)).toEqual([0])
   })
@@ -375,7 +381,7 @@ describe('JSONL single-writer guard: header-only and encoding edges', () => {
 
     const b = await mount(root, 'none')
     await expect(
-      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(m, [chunkEvent(2)], true),
+      (b.sessionPersistence as JsonlSessionPersistence).appendBatch(storageOf(m), [chunkEvent(2)], true),
     ).rejects.toThrow(/seq gap in committed region/)
   })
 })
